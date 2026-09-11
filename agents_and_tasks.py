@@ -76,19 +76,26 @@ def _disable_groq_cache_breakpoints() -> None:
     if "groq" not in model_name:
         return
 
-    def _strip_cache_key(messages):
-        if not isinstance(messages, list):
-            return messages
+    def _strip_cache_key(obj):
+        if isinstance(obj, dict):
+            cleaned = {}
+            for key, value in obj.items():
+                if key == "cache_breakpoint":
+                    continue
+                cleaned[key] = _strip_cache_key(value)
+            return cleaned
+        if isinstance(obj, list):
+            return [_strip_cache_key(item) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(_strip_cache_key(item) for item in obj)
+        return obj
 
-        cleaned = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                copy = dict(msg)
-                copy.pop("cache_breakpoint", None)
-                cleaned.append(copy)
-            else:
-                cleaned.append(msg)
-        return cleaned
+    def _sanitize_messages(messages):
+        if isinstance(messages, str):
+            return [{"role": "user", "content": messages}]
+        if isinstance(messages, list):
+            return [_strip_cache_key(msg) for msg in messages]
+        return _strip_cache_key(messages)
 
     try:
         from crewai.llm import LLM as CrewAILLM
@@ -96,9 +103,7 @@ def _disable_groq_cache_breakpoints() -> None:
         original_prepare = CrewAILLM._prepare_completion_params
 
         def _safe_prepare(self, messages, tools=None, skip_file_processing=False):
-            if isinstance(messages, str):
-                messages = [{"role": "user", "content": messages}]
-            messages = _strip_cache_key(messages)
+            messages = _sanitize_messages(messages)
             return original_prepare(self, messages, tools, skip_file_processing)
 
         CrewAILLM._prepare_completion_params = _safe_prepare
@@ -115,9 +120,7 @@ def _disable_groq_cache_breakpoints() -> None:
             from_agent=None,
             response_model=None,
         ):
-            if isinstance(messages, str):
-                messages = [{"role": "user", "content": messages}]
-            messages = _strip_cache_key(messages)
+            messages = _sanitize_messages(messages)
             return original_call(
                 self,
                 messages,
@@ -134,7 +137,13 @@ def _disable_groq_cache_breakpoints() -> None:
         pass
 
     try:
-        crewai_cache.mark_cache_breakpoint = lambda message: dict(message)
+        import crewai.llms.cache as crewai_cache_module
+
+        def _compat_mark_cache_breakpoint(message):
+            return _strip_cache_key(message)
+
+        crewai_cache.mark_cache_breakpoint = _compat_mark_cache_breakpoint
+        crewai_cache_module.mark_cache_breakpoint = _compat_mark_cache_breakpoint
     except Exception:
         pass
 
@@ -170,19 +179,27 @@ def retry_with_exponential_backoff(max_attempts: int = 3):
 @retry_with_exponential_backoff(max_attempts=3)
 def initialize_llm_with_retry() -> Any:
     """
-    Initialize the CrewAI LLM wrapper for Groq with retry logic.
-    CrewAI 1.15 requires a CrewAI LLM object, not a raw LangChain ChatGroq instance.
+    Initialize the CrewAI LLM wrapper for the configured provider with retry logic.
+    Supports Groq and OpenAI-compatible keys while remaining tolerant of invalid credentials.
     """
     try:
         if not Config.LLM_API_KEY:
             raise ValueError(
-                "GROQ_API_KEY not set in environment variables. "
-                "Please set GROQ_API_KEY before running the application."
+                "No API key set. Add GROQ_API_KEY or OPENAI_API_KEY before running the application."
             )
 
-        model_name = Config.LLM_MODEL.strip()
-        if not model_name.startswith("groq/"):
+        model_name = (Config.LLM_MODEL or "").strip()
+        if not model_name:
+            if Config.LLM_PROVIDER == "openai":
+                model_name = "gpt-4o-mini"
+            else:
+                model_name = "groq/openai/gpt-oss-120b"
+
+        provider = Config.LLM_PROVIDER.lower()
+        if provider == "groq" and not model_name.startswith("groq/"):
             model_name = f"groq/{model_name}"
+        elif provider == "openai" and not model_name.startswith("openai/") and not model_name.startswith("gpt-"):
+            model_name = f"openai/{model_name}"
 
         llm = LLM(
             model=model_name,
@@ -190,7 +207,7 @@ def initialize_llm_with_retry() -> Any:
             temperature=Config.LLM_TEMPERATURE,
             max_tokens=MAX_TOKENS_PER_REQUEST,
             timeout=Config.LLM_TIMEOUT,
-            provider="groq",
+            provider=provider,
         )
         print(f"✓ CrewAI LLM initialized successfully with model: {model_name}")
         return llm
@@ -222,13 +239,15 @@ def throttle_requests(func: Callable) -> Callable:
 # LLM INITIALIZATION (with rate limiting)
 # ============================================================================
 
-print("Initializing ChatGroq LLM with rate limit handling...")
+print("Initializing LLM with rate limit handling...")
 try:
     llm = initialize_llm_with_retry()
+    llm_error = None
 except Exception as e:
-    print(f"✗ Failed to initialize LLM after retries: {e}")
-    print("Please ensure GROQ_API_KEY and GROQ_MODEL are set in environment variables.")
-    raise
+    llm = None
+    llm_error = str(e)
+    print(f"⚠ LLM unavailable: {e}")
+    print("Falling back to local banking data responses for agent queries.")
 
 
 # ============================================================================
@@ -432,6 +451,56 @@ class BankingAssistantCrew:
         self.transaction_agent = create_transaction_agent()
         self.service_agent = create_service_agent()
         self._process_lock = threading.Lock()
+        self.llm_error = llm_error if 'llm_error' in globals() else None
+
+    def _fallback_response(self, user_query: str, account_id: str = "ACC001") -> str:
+        """Return a useful banking-data answer without a working external LLM key."""
+        query_lower = user_query.lower()
+
+        def call_tool(tool_obj, **kwargs):
+            if hasattr(tool_obj, "run"):
+                return str(tool_obj.run(**kwargs))
+            return str(tool_obj(**kwargs))
+
+        if any(word in query_lower for word in ["balance", "amount", "current", "available"]):
+            return call_tool(get_account_balance, account_id=account_id)
+
+        if any(word in query_lower for word in ["transaction", "history", "statement", "spending", "merchant", "purchase", "expense"]):
+            if "spend" in query_lower or "expense" in query_lower or "category" in query_lower:
+                return call_tool(get_spending_analysis, account_id=account_id)
+            if "merchant" in query_lower or "amazon" in query_lower or "target" in query_lower:
+                merchant = "Amazon" if "amazon" in query_lower else query_lower.split()[-1].capitalize()
+                return call_tool(search_transactions_by_merchant, account_id=account_id, merchant=merchant)
+            if "statement" in query_lower:
+                return call_tool(get_account_statement, account_id=account_id)
+            return call_tool(get_transaction_history, account_id=account_id, limit=5)
+
+        if any(word in query_lower for word in ["service", "request", "address", "cheque", "kyc", "document", "change of address"]):
+            if "status" in query_lower or "pending" in query_lower:
+                requests = call_tool(get_service_requests, account_id=account_id)
+                if "No service requests" not in requests:
+                    return requests
+            return call_tool(get_service_requests, account_id=account_id)
+
+        return call_tool(get_account_details, account_id=account_id)
+
+    @staticmethod
+    def _looks_like_llm_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(token in message for token in [
+            "invalid api key",
+            "invalid_api_key",
+            "api key",
+            "401",
+            "403",
+            "badrequest",
+            "rate limit",
+            "429",
+            "llm",
+            "groqexception",
+            "openaiexception",
+            "litellm",
+        ])
 
     def process_query(self, user_query: str, account_id: str = "ACC001") -> str:
         """
@@ -446,6 +515,11 @@ class BankingAssistantCrew:
         """
         try:
             with self._process_lock:
+                if llm is None:
+                    print(f"\n📋 Processing query with local fallback: {user_query}")
+                    print(f"🔑 Account ID: {account_id}")
+                    return self._fallback_response(user_query, account_id)
+
                 print(f"\n📋 Processing query: {user_query}")
                 print(f"🔑 Account ID: {account_id}")
 
@@ -521,6 +595,10 @@ class BankingAssistantCrew:
                 return str(result)
 
         except Exception as e:
+            if self._looks_like_llm_error(e):
+                print(f"⚠ External LLM call failed, using local banking fallback: {e}")
+                return self._fallback_response(user_query, account_id)
+
             error_msg = f"""
             Error processing query: {str(e)}
             

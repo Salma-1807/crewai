@@ -54,9 +54,21 @@ class Config:
     # LLM Configuration - Groq
     # ========================================================================
 
-    # Groq API settings
-    LLM_API_KEY = _get_setting("GROQ_API_KEY", "")
-    LLM_MODEL = _get_setting("GROQ_MODEL", "groq/openai/gpt-oss-120b")
+    # Groq/OpenAI-compatible API settings
+    LLM_PROVIDER = (
+        _get_setting("LLM_PROVIDER", _get_setting("MODEL_PROVIDER", "groq"))
+        or "groq"
+    ).lower()
+    LLM_API_KEY = (
+        _get_setting("GROQ_API_KEY", "")
+        or _get_setting("OPENAI_API_KEY", "")
+        or _get_setting("LLM_API_KEY", "")
+    )
+    LLM_MODEL = (
+        _get_setting("GROQ_MODEL", "")
+        or _get_setting("OPENAI_MODEL", "")
+        or _get_setting("LLM_MODEL", "groq/openai/gpt-oss-120b")
+    )
     LLM_TEMPERATURE = float(_get_setting("LLM_TEMPERATURE", "0.7"))
     LLM_MAX_TOKENS = int(_get_setting("LLM_MAX_TOKENS", "4000"))
     LLM_TIMEOUT = int(_get_setting("LLM_TIMEOUT", "30"))
@@ -111,10 +123,10 @@ class Config:
             True if configuration is valid, False otherwise
         """
         if not cls.LLM_API_KEY:
-            print("⚠ Warning: GROQ_API_KEY not set in environment")
+            print("⚠ Warning: No API key set in environment (GROQ_API_KEY or OPENAI_API_KEY)")
             return False
         if not cls.LLM_MODEL:
-            print("⚠ Warning: GROQ_MODEL not set in environment")
+            print("⚠ Warning: No model set in environment (GROQ_MODEL or OPENAI_MODEL)")
             return False
         return True
 
@@ -148,6 +160,7 @@ class Config:
         print("=" * 60)
 
         print("\n[LLM]")
+        print(f"  Provider: {cls.LLM_PROVIDER}")
         print(f"  Model: {cls.LLM_MODEL}")
         if show_secrets and cls.LLM_API_KEY:
             print(f"  API Key: {cls.LLM_API_KEY[:10]}...")

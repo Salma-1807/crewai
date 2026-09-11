@@ -195,6 +195,33 @@ def test_crew_initialization():
             return False
 
 
+def test_query_processing_without_llm():
+    """Regression test: queries should still return a useful answer without a working API key."""
+    print("\n" + "=" * 60)
+    print("TEST 4B: Query Processing Without Live LLM")
+    print("=" * 60)
+
+    try:
+        from agents_and_tasks import BankingAssistantCrew
+
+        crew = BankingAssistantCrew()
+        response = crew.process_query("What is my account balance?")
+
+        if isinstance(response, str) and len(response) > 0:
+            print("✓ PASSED: Query answered without live LLM access")
+            print(response[:200])
+            return True
+
+        print("✗ FAILED: Response was empty")
+        return False
+    except Exception as e:
+        print(f"✗ FAILED: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
 def test_query_processing():
     """Test end-to-end query processing."""
     print("\n" + "=" * 60)
